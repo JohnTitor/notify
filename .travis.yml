@@ -69,6 +69,8 @@ script:
 
 after_script: set +e
 
+after_failure: cat C:\ProgramData\chocolatey\logs\chocolatey.log
+
 branches:
   only:
     # release tags
