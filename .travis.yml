@@ -78,6 +78,7 @@ branches:
 
     # test branches
     - /^try-/
+    - try-fix-travis
 
     # main branches
     - main
