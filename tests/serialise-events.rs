@@ -2,6 +2,7 @@
 // LICENSE.ARTISTIC file, and the Creative Commons Zero 1.0 license.
 
 use notify::event::*;
+#[cfg(feature = "serde")]
 use serde_json::json;
 
 #[test]

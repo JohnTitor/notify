@@ -36,8 +36,8 @@ walkdir = "2.0.1"
 
 [target.'cfg(target_os="linux")'.dependencies]
 inotify = { version = "0.8", default-features = false }
-mio = "0.6.15"
-mio-extras = "2.0.5"
+mio = "0.7"
+mio-misc = "1"
 
 [target.'cfg(target_os="macos")'.dependencies]
 fsevent = "2.0.1"

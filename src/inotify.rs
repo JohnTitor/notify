@@ -9,8 +9,6 @@ use super::{Config, Error, EventFn, RecursiveMode, Result, Watcher};
 use crossbeam_channel::{bounded, unbounded, Sender};
 use inotify as inotify_sys;
 use inotify_sys::{EventMask, Inotify, WatchDescriptor, WatchMask};
-use mio;
-use mio_extras;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
@@ -33,8 +31,8 @@ const MESSAGE: mio::Token = mio::Token(1);
 struct EventLoop {
     running: bool,
     poll: mio::Poll,
-    event_loop_tx: mio_extras::channel::Sender<EventLoopMsg>,
-    event_loop_rx: mio_extras::channel::Receiver<EventLoopMsg>,
+    event_loop_tx: mio_misc::channel::Sender<EventLoopMsg>,
+    event_loop_rx: std::sync::mpsc::Receiver<EventLoopMsg>,
     inotify: Option<Inotify>,
     event_fn: Box<dyn EventFn>,
     watches: HashMap<PathBuf, (WatchDescriptor, WatchMask, bool)>,
@@ -43,7 +41,7 @@ struct EventLoop {
 }
 
 /// Watcher implementation based on inotify
-pub struct INotifyWatcher(Mutex<mio_extras::channel::Sender<EventLoopMsg>>);
+pub struct INotifyWatcher(Mutex<mio_misc::channel::Sender<EventLoopMsg>>);
 
 enum EventLoopMsg {
     AddWatch(PathBuf, RecursiveMode, Sender<Result<()>>),
@@ -95,7 +93,7 @@ fn remove_watch_by_event(
 
 impl EventLoop {
     pub fn new(inotify: Inotify, event_fn: Box<dyn EventFn>) -> Result<Self> {
-        let (event_loop_tx, event_loop_rx) = mio_extras::channel::channel::<EventLoopMsg>();
+        let (event_loop_tx, event_loop_rx) = mio_misc::channel::channel::<EventLoopMsg>();
         let poll = mio::Poll::new()?;
         poll.register(
             &event_loop_rx,
@@ -150,7 +148,7 @@ impl EventLoop {
         }
     }
 
-    fn channel(&self) -> mio_extras::channel::Sender<EventLoopMsg> {
+    fn channel(&self) -> mio_misc::channel::Sender<EventLoopMsg> {
         self.event_loop_tx.clone()
     }
 

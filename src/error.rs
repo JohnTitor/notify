@@ -1,9 +1,6 @@
 //! Error types
 
 use crate::Config;
-use crossbeam_channel;
-#[cfg(target_os = "linux")]
-use mio_extras;
 use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::result::Result as StdResult;
@@ -149,8 +146,8 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 }
 
 #[cfg(target_os = "linux")]
-impl<T> From<mio_extras::channel::SendError<T>> for Error {
-    fn from(err: mio_extras::channel::SendError<T>) -> Self {
+impl<T> From<mio_misc::channel::SendError<T>> for Error {
+    fn from(err: mio_misc::channel::SendError<T>) -> Self {
         Error::generic(&format!("internal channel error: {:?}", err))
     }
 }
