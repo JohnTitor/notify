@@ -636,6 +636,7 @@ impl<T: Watcher, C: FileIdCache> Drop for Debouncer<T, C> {
 /// Timeout is the amount of time after which a debounced event is emitted.
 ///
 /// If `tick_rate` is `None`, notify will select a tick rate that is 1/4 of the provided timeout.
+#[must_use]
 pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + Send + 'static>(
     timeout: Duration,
     tick_rate: Option<Duration>,
@@ -716,6 +717,7 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
 /// Timeout is the amount of time after which a debounced event is emitted.
 ///
 /// If `tick_rate` is `None`, notify will select a tick rate that is 1/4 of the provided timeout.
+#[must_use]
 pub fn new_debouncer<F: DebounceEventHandler>(
     timeout: Duration,
     tick_rate: Option<Duration>,
@@ -727,6 +729,27 @@ pub fn new_debouncer<F: DebounceEventHandler>(
         event_handler,
         RecommendedCache::new(),
         notify::Config::default(),
+    )
+}
+
+/// Short function to create a new debounced watcher with custom configuration.
+///
+/// Timeout is the amount of time after which a debounced event is emitted.
+///
+/// If `tick_rate` is `None`, notify will select a tick rate that is 1/4 of the provided timeout.
+#[must_use]
+pub fn new_debouncer_with_config<F: DebounceEventHandler>(
+    timeout: Duration,
+    tick_rate: Option<Duration>,
+    event_handler: F,
+    config: notify::Config,
+) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>, Error> {
+    new_debouncer_opt::<F, RecommendedWatcher, RecommendedCache>(
+        timeout,
+        tick_rate,
+        event_handler,
+        RecommendedCache::new(),
+        config,
     )
 }
 

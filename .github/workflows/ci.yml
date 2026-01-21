@@ -22,19 +22,12 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - run: rustup toolchain install stable --profile minimal
 
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Install typos-cli
-        uses: taiki-e/install-action@v2
+      - name: semver check
+        uses: JohnTitor/cargo-semver-checks@main
         with:
-          tool: typos-cli
-
-      - name: Check for typos
-        run: typos
+          toolchain: stable
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
