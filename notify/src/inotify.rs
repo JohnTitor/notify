@@ -1,8 +1,10 @@
 //! Watcher implementation for the inotify Linux API
 //!
-//! The inotify API provides a mechanism for monitoring filesystem events.  Inotify can be used to
-//! monitor individual files, or to monitor directories.  When a directory is monitored, inotify
+//! The inotify API provides a mechanism for monitoring filesystem events. Inotify can be used to
+//! monitor individual files, or to monitor directories. When a directory is monitored, inotify
 //! will return events for the directory itself, and for files inside the directory.
+//!
+//! For relative paths passed to [`Watcher::watch`], events preserve the same relative prefix.
 
 use super::event::*;
 use super::{Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, Watcher};
@@ -78,6 +80,12 @@ fn event_kind_mask_to_watch_mask(mask: EventKindMask, is_recursive: bool) -> Wat
 //
 // -  events telling it that something has happened on one of the watched files.
 
+#[derive(Clone, Debug)]
+struct WatchPath {
+    user: PathBuf,
+    real: PathBuf,
+}
+
 struct EventLoop {
     running: bool,
     poll: mio::Poll,
@@ -86,9 +94,9 @@ struct EventLoop {
     event_loop_rx: Receiver<EventLoopMsg>,
     inotify: Option<Inotify>,
     event_handler: Box<dyn EventHandler>,
-    /// PathBuf -> (WatchDescriptor, WatchMask, is_recursive, is_dir)
+    /// Real path -> (WatchDescriptor, WatchMask, is_recursive, is_dir)
     watches: HashMap<PathBuf, (WatchDescriptor, WatchMask, bool, bool)>,
-    paths: HashMap<WatchDescriptor, PathBuf>,
+    paths: HashMap<WatchDescriptor, WatchPath>,
     rename_event: Option<Event>,
     follow_links: bool,
     event_kind_mask: EventKindMask,
@@ -102,38 +110,43 @@ pub struct INotifyWatcher {
 }
 
 enum EventLoopMsg {
-    AddWatch(PathBuf, RecursiveMode, Sender<Result<()>>),
+    AddWatch(WatchPath, RecursiveMode, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
     Shutdown,
     Configure(Config, BoundSender<Result<bool>>),
 }
 
 #[inline]
-fn add_watch_by_event(
-    path: &PathBuf,
+fn maybe_add_watch_for_event(
     event: &inotify_sys::Event<&OsStr>,
+    watch_path: &WatchPath,
     watches: &HashMap<PathBuf, (WatchDescriptor, WatchMask, bool, bool)>,
-    add_watches: &mut Vec<PathBuf>,
+    add_watches: &mut Vec<WatchPath>,
 ) {
-    if event.mask.contains(EventMask::ISDIR) {
-        if let Some(parent_path) = path.parent() {
-            if let Some(&(_, _, is_recursive, _)) = watches.get(parent_path) {
-                if is_recursive {
-                    add_watches.push(path.to_owned());
-                }
+    if !event.mask.contains(EventMask::ISDIR) {
+        return;
+    }
+
+    if let Some(&(_, _, is_recursive, _)) = watches.get(&watch_path.real) {
+        if is_recursive {
+            if let Some(name) = event.name {
+                add_watches.push(WatchPath {
+                    user: watch_path.user.join(name),
+                    real: watch_path.real.join(name),
+                });
             }
         }
     }
 }
 
 #[inline]
-fn remove_watch_by_event(
-    path: &PathBuf,
+fn maybe_remove_watch_for_path(
+    real_path: &Path,
     watches: &HashMap<PathBuf, (WatchDescriptor, WatchMask, bool, bool)>,
     remove_watches: &mut Vec<PathBuf>,
 ) {
-    if watches.contains_key(path) {
-        remove_watches.push(path.to_owned());
+    if watches.contains_key(real_path) {
+        remove_watches.push(real_path.to_owned());
     }
 }
 
@@ -247,8 +260,8 @@ impl EventLoop {
     }
 
     fn handle_inotify(&mut self) {
-        let mut add_watches = Vec::new();
-        let mut remove_watches = Vec::new();
+        let mut add_watches: Vec<WatchPath> = Vec::new();
+        let mut remove_watches: Vec<PathBuf> = Vec::new();
 
         if let Some(ref mut inotify) = self.inotify {
             let mut buffer = [0; 1024];
@@ -266,12 +279,7 @@ impl EventLoop {
                                 self.event_handler.handle_event(ev);
                             }
 
-                            let path = match event.name {
-                                Some(name) => self.paths.get(&event.wd).map(|root| root.join(name)),
-                                None => self.paths.get(&event.wd).cloned(),
-                            };
-
-                            let path = match path {
+                            let watch_path = match self.paths.get(&event.wd) {
                                 Some(path) => path,
                                 None => {
                                     log::debug!("inotify event with unknown descriptor: {event:?}");
@@ -279,15 +287,27 @@ impl EventLoop {
                                 }
                             };
 
+                            let (user_path, real_path) = match event.name {
+                                Some(name) => (
+                                    watch_path.user.join(name),
+                                    watch_path.real.join(name),
+                                ),
+                                None => (watch_path.user.clone(), watch_path.real.clone()),
+                            };
+
                             let mut evs = Vec::new();
 
                             if event.mask.contains(EventMask::MOVED_FROM) {
-                                remove_watch_by_event(&path, &self.watches, &mut remove_watches);
+                                maybe_remove_watch_for_path(
+                                    &real_path,
+                                    &self.watches,
+                                    &mut remove_watches,
+                                );
 
                                 let event = Event::new(EventKind::Modify(ModifyKind::Name(
                                     RenameMode::From,
                                 )))
-                                .add_path(path.clone())
+                                .add_path(user_path.clone())
                                 .set_tracker(event.cookie as usize);
 
                                 self.rename_event = Some(event.clone());
@@ -297,7 +317,7 @@ impl EventLoop {
                                 evs.push(
                                     Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
                                         .set_tracker(event.cookie as usize)
-                                        .add_path(path.clone()),
+                                        .add_path(user_path.clone()),
                                 );
 
                                 let trackers_match =
@@ -312,17 +332,22 @@ impl EventLoop {
                                         )))
                                         .set_tracker(event.cookie as usize)
                                         .add_some_path(rename_event.paths.first().cloned())
-                                        .add_path(path.clone()),
+                                        .add_path(user_path.clone()),
                                     );
                                 }
-                                add_watch_by_event(&path, &event, &self.watches, &mut add_watches);
+                                maybe_add_watch_for_event(
+                                    &event,
+                                    watch_path,
+                                    &self.watches,
+                                    &mut add_watches,
+                                );
                             }
                             if event.mask.contains(EventMask::MOVE_SELF) {
                                 evs.push(
                                     Event::new(EventKind::Modify(ModifyKind::Name(
                                         RenameMode::From,
                                     )))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
                                 // TODO stat the path and get to new path
                                 // - emit To and Both events
@@ -337,9 +362,14 @@ impl EventLoop {
                                             CreateKind::File
                                         },
                                     ))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
-                                add_watch_by_event(&path, &event, &self.watches, &mut add_watches);
+                                maybe_add_watch_for_event(
+                                    &event,
+                                    watch_path,
+                                    &self.watches,
+                                    &mut add_watches,
+                                );
                             }
                             if event.mask.contains(EventMask::DELETE) {
                                 evs.push(
@@ -350,28 +380,36 @@ impl EventLoop {
                                             RemoveKind::File
                                         },
                                     ))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
-                                remove_watch_by_event(&path, &self.watches, &mut remove_watches);
+                                maybe_remove_watch_for_path(
+                                    &real_path,
+                                    &self.watches,
+                                    &mut remove_watches,
+                                );
                             }
                             if event.mask.contains(EventMask::DELETE_SELF) {
-                                let remove_kind = match self.watches.get(&path) {
+                                let remove_kind = match self.watches.get(&real_path) {
                                     Some(&(_, _, _, true)) => RemoveKind::Folder,
                                     Some(&(_, _, _, false)) => RemoveKind::File,
                                     None => RemoveKind::Other,
                                 };
                                 evs.push(
                                     Event::new(EventKind::Remove(remove_kind))
-                                        .add_path(path.clone()),
+                                        .add_path(user_path.clone()),
                                 );
-                                remove_watch_by_event(&path, &self.watches, &mut remove_watches);
+                                maybe_remove_watch_for_path(
+                                    &real_path,
+                                    &self.watches,
+                                    &mut remove_watches,
+                                );
                             }
                             if event.mask.contains(EventMask::MODIFY) {
                                 evs.push(
                                     Event::new(EventKind::Modify(ModifyKind::Data(
                                         DataChange::Any,
                                     )))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
                             }
                             if event.mask.contains(EventMask::CLOSE_WRITE) {
@@ -379,7 +417,7 @@ impl EventLoop {
                                     Event::new(EventKind::Access(AccessKind::Close(
                                         AccessMode::Write,
                                     )))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
                             }
                             if event.mask.contains(EventMask::CLOSE_NOWRITE) {
@@ -387,7 +425,7 @@ impl EventLoop {
                                     Event::new(EventKind::Access(AccessKind::Close(
                                         AccessMode::Read,
                                     )))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
                             }
                             if event.mask.contains(EventMask::ATTRIB) {
@@ -395,7 +433,7 @@ impl EventLoop {
                                     Event::new(EventKind::Modify(ModifyKind::Metadata(
                                         MetadataKind::Any,
                                     )))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
                             }
                             if event.mask.contains(EventMask::OPEN) {
@@ -403,7 +441,7 @@ impl EventLoop {
                                     Event::new(EventKind::Access(AccessKind::Open(
                                         AccessMode::Any,
                                     )))
-                                    .add_path(path.clone()),
+                                    .add_path(user_path.clone()),
                                 );
                             }
 
@@ -454,19 +492,41 @@ impl EventLoop {
         }
     }
 
-    fn add_watch(&mut self, path: PathBuf, is_recursive: bool, mut watch_self: bool) -> Result<()> {
+    fn add_watch(&mut self, path: WatchPath, is_recursive: bool, mut watch_self: bool) -> Result<()> {
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
-        if !is_recursive || !metadata(&path).map_err(Error::io_watch)?.is_dir() {
+        if !is_recursive || !metadata(&path.real).map_err(Error::io_watch)?.is_dir() {
             return self.add_single_watch(path, false, true);
         }
 
-        for entry in WalkDir::new(path)
+        let WatchPath {
+            user: user_root,
+            real: real_root,
+        } = path;
+
+        for entry in WalkDir::new(&real_root)
             .follow_links(self.follow_links)
             .into_iter()
             .filter_map(filter_dir)
         {
-            self.add_single_watch(entry.into_path(), is_recursive, watch_self)?;
+            let entry_real = entry.into_path();
+            let rel = entry_real
+                .strip_prefix(&real_root)
+                .unwrap_or_else(|_| Path::new(""));
+            let entry_user = if rel.as_os_str().is_empty() {
+                user_root.clone()
+            } else {
+                user_root.join(rel)
+            };
+
+            self.add_single_watch(
+                WatchPath {
+                    user: entry_user,
+                    real: entry_real,
+                },
+                is_recursive,
+                watch_self,
+            )?;
             watch_self = false;
         }
 
@@ -475,10 +535,11 @@ impl EventLoop {
 
     fn add_single_watch(
         &mut self,
-        path: PathBuf,
+        path: WatchPath,
         is_recursive: bool,
         watch_self: bool,
     ) -> Result<()> {
+        let WatchPath { mut user, real } = path;
         // Build watch mask from configured event kinds for kernel-level filtering
         let mut watchmask = event_kind_mask_to_watch_mask(self.event_kind_mask, is_recursive);
 
@@ -487,15 +548,18 @@ impl EventLoop {
             watchmask.insert(WatchMask::MOVE_SELF);
         }
 
-        if let Some(&(_, old_watchmask, _, _)) = self.watches.get(&path) {
-            watchmask.insert(old_watchmask);
+        if let Some((existing_wd, old_watchmask, _, _)) = self.watches.get(&real) {
+            if let Some(existing_path) = self.paths.get(existing_wd) {
+                user = existing_path.user.clone();
+            }
+            watchmask.insert(*old_watchmask);
             watchmask.insert(WatchMask::MASK_ADD);
         }
 
         if let Some(ref mut inotify) = self.inotify {
-            log::trace!("adding inotify watch: {}", path.display());
+            log::trace!("adding inotify watch: {}", real.display());
 
-            match inotify.watches().add(&path, watchmask) {
+            match inotify.watches().add(&real, watchmask) {
                 Err(e) => {
                     Err(if e.raw_os_error() == Some(libc::ENOSPC) {
                         // do not report inotify limits as "no more space" on linux #266
@@ -505,14 +569,14 @@ impl EventLoop {
                     } else {
                         Error::io(e)
                     }
-                    .add_path(path))
+                    .add_path(real.clone()))
                 }
                 Ok(w) => {
                     watchmask.remove(WatchMask::MASK_ADD);
-                    let is_dir = metadata(&path).map_err(Error::io)?.is_dir();
+                    let is_dir = metadata(&real).map_err(Error::io)?.is_dir();
                     self.watches
-                        .insert(path.clone(), (w.clone(), watchmask, is_recursive, is_dir));
-                    self.paths.insert(w, path);
+                        .insert(real.clone(), (w.clone(), watchmask, is_recursive, is_dir));
+                    self.paths.insert(w, WatchPath { user, real });
                     Ok(())
                 }
             }
@@ -535,9 +599,9 @@ impl EventLoop {
                     if is_recursive || remove_recursive {
                         let mut remove_list = Vec::new();
                         for (w, p) in &self.paths {
-                            if p.starts_with(&path) {
+                            if p.real.starts_with(&path) {
                                 Self::remove_single_descriptor(&mut inotify_watches, w.clone());
-                                self.watches.remove(p);
+                                self.watches.remove(&p.real);
                                 remove_list.push(w.clone());
                             }
                         }
@@ -585,7 +649,7 @@ impl EventLoop {
             for (w, p) in &self.paths {
                 inotify_watches
                     .remove(w.clone())
-                    .map_err(|e| Error::io(e).add_path(p.into()))?;
+                    .map_err(|e| Error::io(e).add_path(p.real.clone()))?;
             }
             self.watches.clear();
             self.paths.clear();
@@ -617,14 +681,15 @@ impl INotifyWatcher {
     }
 
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        let pb = if path.is_absolute() {
+        let user = path.to_owned();
+        let real = if path.is_absolute() {
             path.to_owned()
         } else {
             let p = env::current_dir().map_err(Error::io)?;
             p.join(path)
         };
         let (tx, rx) = unbounded();
-        let msg = EventLoopMsg::AddWatch(pb, recursive_mode, tx);
+        let msg = EventLoopMsg::AddWatch(WatchPath { user, real }, recursive_mode, tx);
 
         // we expect the event loop to live and reply => unwraps must not panic
         self.channel.send(msg).unwrap();
@@ -686,10 +751,11 @@ impl Drop for INotifyWatcher {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         path::{Path, PathBuf},
         sync::{atomic::AtomicBool, mpsc, Arc},
         thread::{self, available_parallelism},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::inotify_sys::WatchMask;
@@ -736,6 +802,49 @@ mod tests {
                 kind: ErrorKind::PathNotFound
             })
         ))
+    }
+
+    #[test]
+    fn relative_watch_paths_are_preserved() {
+        let cwd = env::current_dir().expect("current dir");
+        let tmpdir = tempfile::tempdir_in(&cwd).expect("tempdir");
+        let rel_root = tmpdir
+            .path()
+            .strip_prefix(&cwd)
+            .expect("tempdir in cwd")
+            .to_path_buf();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = INotifyWatcher::new(tx, Config::default()).expect("watcher");
+        watcher
+            .watch(&rel_root, RecursiveMode::Recursive)
+            .expect("watch");
+
+        let file_path = tmpdir.path().join("file.txt");
+        std::fs::write(&file_path, b"data").expect("write");
+
+        let expected = rel_root.join("file.txt");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(event)) => {
+                    if event.paths.iter().any(|p| p == &expected) {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(found, "did not receive expected path {expected:?}");
     }
 
     /// Runs manually.
