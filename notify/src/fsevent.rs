@@ -26,6 +26,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -68,6 +69,10 @@ pub struct FsEventWatcher {
     flags: fs::FSEventStreamCreateFlags,
     event_handler: Arc<Mutex<dyn EventHandler>>,
     runloop: Option<(cf::CFRetained<cf::CFRunLoop>, thread::JoinHandle<()>)>,
+    stream: Option<fs::FSEventStreamRef>,
+    // Keep the stream context alive for the lifetime of the running stream.
+    // This avoids potential use-after-free if CoreServices invokes callbacks late.
+    stream_context: Option<Arc<StreamContextInfo>>,
     recursive_info: HashMap<PathBuf, bool>,
     event_kinds: EventKindMask,
 }
@@ -261,20 +266,24 @@ struct StreamContextInfo {
     event_handler: Arc<Mutex<dyn EventHandler>>,
     recursive_info: HashMap<PathBuf, bool>,
     event_kinds: EventKindMask,
+    // Set to `false` during shutdown so any late callbacks can be safely ignored.
+    alive: AtomicBool,
 }
 
 // Free the context when the stream created by `FSEventStreamCreate` is released.
 unsafe extern "C-unwind" fn release_context(info: *const libc::c_void) {
     // Safety:
     // - The [documentation] for `FSEventStreamContext` states that `release` is only
-    //   called when the stream is deallocated, so it is safe to convert `info` back into a
-    //   box and drop it.
+    //   called when the stream is deallocated, so it is safe to drop `info`.
     //
     // [docs]: https://developer.apple.com/documentation/coreservices/fseventstreamcontext?language=objc
     unsafe {
-        drop(Box::from_raw(
-            info as *const StreamContextInfo as *mut StreamContextInfo,
-        ));
+        if info.is_null() {
+            return;
+        }
+
+        // `info` was created using `Arc::into_raw`.
+        drop(Arc::from_raw(info as *const StreamContextInfo));
     }
 }
 
@@ -292,6 +301,8 @@ impl FsEventWatcher {
                 | fs::kFSEventStreamCreateFlagWatchRoot,
             event_handler,
             runloop: None,
+            stream: None,
+            stream_context: None,
             recursive_info: HashMap::new(),
             event_kinds,
         })
@@ -354,7 +365,22 @@ impl FsEventWatcher {
             return;
         }
 
+        if let Some(context) = &self.stream_context {
+            context.alive.store(false, Ordering::Release);
+        }
+
         if let Some((runloop, thread_handle)) = self.runloop.take() {
+            while !runloop.is_waiting() {
+                thread::yield_now();
+            }
+
+            // Drain any queued events before stopping the runloop to reduce the chance of late
+            // callbacks during shutdown (see PR #552).
+            if let Some(stream) = self.stream {
+                unsafe { fs::FSEventStreamFlushSync(stream) };
+            }
+
+            // Flushing may itself invoke callbacks; stop the runloop once we're idle.
             while !runloop.is_waiting() {
                 thread::yield_now();
             }
@@ -364,6 +390,9 @@ impl FsEventWatcher {
             // Wait for the thread to shut down.
             thread_handle.join().expect("thread to shut down");
         }
+
+        self.stream = None;
+        self.stream_context = None;
     }
 
     fn remove_path(&mut self, path: &Path) -> Result<()> {
@@ -434,15 +463,17 @@ impl FsEventWatcher {
         // to the rest of the system. This will be owned by the stream, and will be freed when the
         // stream is closed. This means we will leak the context if we panic before reaching
         // `FSEventStreamRelease`.
-        let context = Box::into_raw(Box::new(StreamContextInfo {
+        let context = Arc::new(StreamContextInfo {
             event_handler: self.event_handler.clone(),
             recursive_info: self.recursive_info.clone(),
             event_kinds: self.event_kinds,
-        }));
+            alive: AtomicBool::new(true),
+        });
+        let context_for_stream = Arc::into_raw(context.clone());
 
         let stream_context = fs::FSEventStreamContext {
             version: 0,
-            info: context as *mut libc::c_void,
+            info: context_for_stream as *mut libc::c_void,
             retain: None,
             release: Some(release_context),
             copyDescription: None,
@@ -459,6 +490,7 @@ impl FsEventWatcher {
                 self.flags,
             )
         };
+        let stream_ref = stream;
 
         // Wrapper to help send CFRunLoop types across threads.
         struct CFRunLoopSendWrapper(cf::CFRetained<cf::CFRunLoop>);
@@ -481,6 +513,7 @@ impl FsEventWatcher {
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
 
+        let context_for_thread = context.clone();
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
             .spawn(move || {
@@ -515,14 +548,10 @@ impl FsEventWatcher {
                         .expect("Unable to send runloop to watcher");
 
                     cf::CFRunLoop::run();
+
+                    // We're about to shut the stream down; ignore any late events.
+                    context_for_thread.alive.store(false, Ordering::Release);
                     fs::FSEventStreamStop(stream);
-                    // There are edge-cases, when many events are pending,
-                    // despite the stream being stopped, that the stream's
-                    // associated callback will be invoked. Purging events
-                    // is intended to prevent this.
-                    let event_id = fs::FSEventsGetCurrentEventId();
-                    let device = fs::FSEventStreamGetDeviceBeingWatched(stream);
-                    fs::FSEventsPurgeEventsForDeviceUpToEventId(device, event_id);
                     fs::FSEventStreamInvalidate(stream);
                     fs::FSEventStreamRelease(stream);
                 }
@@ -530,6 +559,8 @@ impl FsEventWatcher {
         // block until runloop has been sent
         let runloop_wrapper = rl_rx.recv().unwrap()?;
         self.runloop = Some((runloop_wrapper.0, thread_handle));
+        self.stream = Some(stream_ref);
+        self.stream_context = Some(context);
 
         Ok(())
     }
@@ -575,7 +606,20 @@ unsafe fn callback_impl(
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
-    let event_handler = &(*info).event_handler;
+    if info.is_null() {
+        return;
+    }
+
+    // Keep the stream context alive for the duration of this callback, even if the stream is
+    // being invalidated concurrently.
+    Arc::increment_strong_count(info);
+    let info = Arc::from_raw(info);
+
+    if !info.alive.load(Ordering::Acquire) {
+        return;
+    }
+
+    let event_handler = &info.event_handler;
 
     for p in 0..num_events {
         // Paths are not guaranteed to be valid UTF-8 (e.g. NFS); keep them as raw bytes.
@@ -591,7 +635,7 @@ unsafe fn callback_impl(
         }
 
         let mut handle_event = false;
-        for (p, r) in &(*info).recursive_info {
+        for (p, r) in &info.recursive_info {
             if path.starts_with(p) {
                 if *r || &path == p {
                     handle_event = true;
@@ -615,7 +659,7 @@ unsafe fn callback_impl(
             // TODO: precise
             let ev = ev.add_path(path.clone());
             // Filter events based on EventKindMask
-            if !(*info).event_kinds.matches(&ev.kind) {
+            if !info.event_kinds.matches(&ev.kind) {
                 continue; // Skip events that don't match the mask
             }
             let mut event_handler = match event_handler.lock() {
@@ -767,12 +811,13 @@ mod tests {
         let mut recursive_info = HashMap::new();
         recursive_info.insert(PathBuf::from("/tmp"), true);
 
-        let context = Box::new(StreamContextInfo {
+        let context = Arc::new(StreamContextInfo {
             event_handler,
             recursive_info,
             event_kinds: EventKindMask::ALL,
+            alive: AtomicBool::new(true),
         });
-        let context_ptr = Box::into_raw(context) as *mut libc::c_void;
+        let context_ptr = Arc::into_raw(context.clone()) as *mut libc::c_void;
 
         let bytes = b"/tmp/\xff";
         let c_path = CString::new(bytes.as_slice()).expect("cstring");
@@ -796,9 +841,7 @@ mod tests {
                 event_ids,
             );
         });
-        unsafe {
-            drop(Box::from_raw(context_ptr as *mut StreamContextInfo));
-        }
+        unsafe { release_context(context_ptr as *const libc::c_void) };
 
         assert!(res.is_ok(), "callback_impl should not panic");
 
@@ -825,12 +868,13 @@ mod tests {
         let mut recursive_info = HashMap::new();
         recursive_info.insert(PathBuf::from("/tmp"), true);
 
-        let context = Box::new(StreamContextInfo {
+        let context = Arc::new(StreamContextInfo {
             event_handler,
             recursive_info,
             event_kinds: EventKindMask::ALL,
+            alive: AtomicBool::new(true),
         });
-        let context_ptr = Box::into_raw(context) as *mut libc::c_void;
+        let context_ptr = Arc::into_raw(context.clone()) as *mut libc::c_void;
 
         let c_path = CString::new("/tmp/file").expect("cstring");
         let path_ptrs = [c_path.as_ptr()];
@@ -864,9 +908,7 @@ mod tests {
                 event_ids,
             );
         });
-        unsafe {
-            drop(Box::from_raw(context_ptr as *mut StreamContextInfo));
-        }
+        unsafe { release_context(context_ptr as *const libc::c_void) };
 
         assert!(res.is_ok(), "callback_impl should not panic");
 
@@ -878,6 +920,91 @@ mod tests {
             event.kind.is_create(),
             "expected create event, got {event:?}"
         );
+    }
+
+    /// Regression test for PR #552.
+    ///
+    /// During shutdown, CoreServices may still invoke the callback; those events must be ignored.
+    #[test]
+    fn callback_impl_drops_events_when_context_is_not_alive() {
+        use std::ffi::CString;
+        use std::ptr;
+
+        let (tx, rx) = std::sync::mpsc::channel::<crate::Result<Event>>();
+        let event_handler: Arc<Mutex<dyn EventHandler>> = Arc::new(Mutex::new(tx));
+
+        let mut recursive_info = HashMap::new();
+        recursive_info.insert(PathBuf::from("/tmp"), true);
+
+        let context = Arc::new(StreamContextInfo {
+            event_handler,
+            recursive_info,
+            event_kinds: EventKindMask::ALL,
+            alive: AtomicBool::new(false),
+        });
+        let context_ptr = Arc::into_raw(context.clone()) as *mut libc::c_void;
+
+        let bytes = b"/tmp/\xff";
+        let c_path = CString::new(bytes.as_slice()).expect("cstring");
+        let path_ptrs = [c_path.as_ptr()];
+        let event_paths = NonNull::new(path_ptrs.as_ptr() as *mut libc::c_void).unwrap();
+
+        let flags_arr = [StreamFlags::ITEM_CREATED.bits() as fs::FSEventStreamEventFlags];
+        let event_flags =
+            NonNull::new(flags_arr.as_ptr() as *mut fs::FSEventStreamEventFlags).unwrap();
+
+        let ids_arr = [0 as fs::FSEventStreamEventId];
+        let event_ids = NonNull::new(ids_arr.as_ptr() as *mut fs::FSEventStreamEventId).unwrap();
+
+        unsafe {
+            callback_impl(
+                ptr::null(),
+                context_ptr,
+                1,
+                event_paths,
+                event_flags,
+                event_ids,
+            );
+        }
+        unsafe { release_context(context_ptr as *const libc::c_void) };
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "expected no event when context is not alive"
+        );
+    }
+
+    /// Regression test for PR #552.
+    ///
+    /// Repeatedly creating and dropping watchers while the filesystem is busy should not crash.
+    #[test]
+    fn drop_watcher_while_events_pending_does_not_crash() {
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let file_path = tmpdir.path().join("load");
+        std::fs::write(&file_path, b"0").expect("seed file");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = stop.clone();
+        let writer = thread::spawn(move || {
+            let mut i: u64 = 0;
+            while !stop_writer.load(Ordering::Relaxed) {
+                let _ = std::fs::write(&file_path, i.to_string());
+                i = i.wrapping_add(1);
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        // Leave enough iterations to catch late-callback issues, but keep runtime reasonable for CI.
+        for _ in 0..50 {
+            let mut watcher = FsEventWatcher::new(|_| (), Config::default()).expect("watcher");
+            watcher
+                .watch(tmpdir.path(), RecursiveMode::Recursive)
+                .expect("watch");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread");
     }
 
     #[test]
