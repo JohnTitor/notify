@@ -176,7 +176,7 @@
 pub use config::{Config, PathOp, RecursiveMode, WatchPathConfig, WindowsPathSeparatorStyle};
 pub use error::{Error, ErrorKind, Result, UpdatePathsError};
 pub use notify_types::event::{self, Event, EventKind, EventKindMask};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) type StdResult<T, E> = std::result::Result<T, E>;
 pub(crate) type Receiver<T> = std::sync::mpsc::Receiver<T>;
@@ -433,6 +433,20 @@ pub trait Watcher {
         Ok(false)
     }
 
+    /// Returns the currently watched paths.
+    ///
+    /// Backends may normalize paths (for example converting to absolute or canonical paths)
+    /// before storing them. The returned list uses that internal representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the watcher implementation cannot provide this information.
+    fn watched_paths(&self) -> Result<Vec<PathBuf>> {
+        Err(Error::generic(
+            "listing watched paths is not supported by this watcher",
+        ))
+    }
+
     /// Returns the watcher kind, allowing to perform backend-specific tasks
     fn kind() -> WatcherKind
     where
@@ -515,6 +529,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs, iter,
         path::{Path, PathBuf},
         sync::mpsc,
@@ -567,6 +582,17 @@ mod tests {
                     .expect("received an error"),
             )
         })
+    }
+
+    fn canonical_or_path(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn canonical_path_set(paths: Vec<PathBuf>) -> HashSet<PathBuf> {
+        paths
+            .into_iter()
+            .map(|path| canonical_or_path(&path))
+            .collect()
     }
 
     #[test]
@@ -689,6 +715,34 @@ mod tests {
             }
         }
         panic!("Did not receive the event of {b_file2:?}");
+    }
+
+    #[test]
+    fn watched_paths_reflect_watch_and_unwatch(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir(&dir_a)?;
+        fs::create_dir(&dir_b)?;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
+
+        watcher.watch(&dir_a, RecursiveMode::Recursive)?;
+        watcher.watch(&dir_b, RecursiveMode::NonRecursive)?;
+
+        let watched = canonical_path_set(watcher.watched_paths()?);
+        assert!(watched.contains(&canonical_or_path(&dir_a)));
+        assert!(watched.contains(&canonical_or_path(&dir_b)));
+
+        watcher.unwatch(&dir_a)?;
+
+        let watched = canonical_path_set(watcher.watched_paths()?);
+        assert!(!watched.contains(&canonical_or_path(&dir_a)));
+        assert!(watched.contains(&canonical_or_path(&dir_b)));
+
+        Ok(())
     }
 
     #[test]

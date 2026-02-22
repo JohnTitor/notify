@@ -48,6 +48,7 @@ pub struct KqueueWatcher {
 enum EventLoopMsg {
     AddWatch(PathBuf, RecursiveMode, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
+    GetWatchedPaths(Sender<Vec<PathBuf>>),
     Shutdown,
 }
 
@@ -138,6 +139,9 @@ impl EventLoop {
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
+                }
+                EventLoopMsg::GetWatchedPaths(tx) => {
+                    let _ = tx.send(self.watches.keys().cloned().collect());
                 }
                 EventLoopMsg::Shutdown => {
                     self.running = false;
@@ -439,6 +443,13 @@ impl KqueueWatcher {
             .unwrap()
             .map_err(|e| Error::generic(&e.to_string()))
     }
+
+    fn watched_paths_inner(&self) -> Result<Vec<PathBuf>> {
+        let (tx, rx) = unbounded();
+        self.channel.send(EventLoopMsg::GetWatchedPaths(tx))?;
+        self.waker.wake()?;
+        rx.recv().map_err(Error::from)
+    }
 }
 
 impl Watcher for KqueueWatcher {
@@ -457,6 +468,10 @@ impl Watcher for KqueueWatcher {
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
         self.unwatch_inner(path)
+    }
+
+    fn watched_paths(&self) -> Result<Vec<PathBuf>> {
+        self.watched_paths_inner()
     }
 
     fn kind() -> crate::WatcherKind {

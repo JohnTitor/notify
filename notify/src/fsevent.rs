@@ -704,6 +704,10 @@ impl Watcher for FsEventWatcher {
         rx.recv()?
     }
 
+    fn watched_paths(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.recursive_info.keys().cloned().collect())
+    }
+
     fn kind() -> crate::WatcherKind {
         crate::WatcherKind::Fsevent
     }

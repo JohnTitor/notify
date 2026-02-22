@@ -718,6 +718,11 @@ impl Watcher for PollWatcher {
         self.unwatch_inner(path)
     }
 
+    fn watched_paths(&self) -> crate::Result<Vec<PathBuf>> {
+        let watches = self.watches.lock().map_err(crate::Error::from)?;
+        Ok(watches.keys().cloned().collect())
+    }
+
     fn kind() -> crate::WatcherKind {
         crate::WatcherKind::PollWatcher
     }

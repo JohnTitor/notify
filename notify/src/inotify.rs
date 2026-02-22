@@ -111,6 +111,7 @@ pub struct INotifyWatcher {
 enum EventLoopMsg {
     AddWatch(PathBuf, RecursiveMode, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
+    GetWatchedPaths(Sender<Vec<PathBuf>>),
     Shutdown,
     Configure(Config, BoundSender<Result<bool>>),
 }
@@ -239,6 +240,9 @@ impl EventLoop {
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
+                }
+                EventLoopMsg::GetWatchedPaths(tx) => {
+                    let _ = tx.send(self.watches.keys().cloned().collect());
                 }
                 EventLoopMsg::Shutdown => {
                     let _ = self.remove_all_watches();
@@ -744,6 +748,13 @@ impl INotifyWatcher {
         self.waker.wake().unwrap();
         rx.recv().unwrap()
     }
+
+    fn watched_paths_inner(&self) -> Result<Vec<PathBuf>> {
+        let (tx, rx) = unbounded();
+        self.channel.send(EventLoopMsg::GetWatchedPaths(tx))?;
+        self.waker.wake()?;
+        rx.recv().map_err(Error::from)
+    }
 }
 
 impl Watcher for INotifyWatcher {
@@ -765,6 +776,10 @@ impl Watcher for INotifyWatcher {
         self.channel.send(EventLoopMsg::Configure(config, tx))?;
         self.waker.wake()?;
         rx.recv()?
+    }
+
+    fn watched_paths(&self) -> Result<Vec<PathBuf>> {
+        self.watched_paths_inner()
     }
 
     fn kind() -> crate::WatcherKind {
