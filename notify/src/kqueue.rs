@@ -13,6 +13,7 @@ use crate::paths::{
     recursive_user_watch_ancestor, reported_path, WatchMetadata as Watch, WatchPath,
 };
 use crate::{unbounded, Receiver, Sender};
+use crate::{PathOp, StdResult, UpdatePathsError};
 use kqueue::{EventData, EventFilter, FilterFlag, Ident};
 use std::collections::HashMap;
 use std::fs::metadata;
@@ -53,8 +54,34 @@ pub struct KqueueWatcher {
 enum EventLoopMsg {
     AddWatch(WatchPath, RecursiveMode, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
+    UpdatePaths(
+        Vec<EventLoopPathOp>,
+        Sender<StdResult<(), UpdatePathsError>>,
+    ),
     GetWatchedPaths(Sender<Vec<(PathBuf, RecursiveMode)>>),
     Shutdown,
+}
+
+enum EventLoopPathOp {
+    Watch {
+        path: WatchPath,
+        recursive_mode: RecursiveMode,
+        origin: PathOp,
+    },
+    Unwatch {
+        path: PathBuf,
+        origin: PathOp,
+    },
+}
+
+impl EventLoopPathOp {
+    fn into_origin(self) -> PathOp {
+        match self {
+            EventLoopPathOp::Watch { origin, .. } | EventLoopPathOp::Unwatch { origin, .. } => {
+                origin
+            }
+        }
+    }
 }
 
 impl EventLoop {
@@ -145,6 +172,9 @@ impl EventLoop {
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
                 }
+                EventLoopMsg::UpdatePaths(ops, tx) => {
+                    let _ = tx.send(self.update_paths(ops));
+                }
                 EventLoopMsg::GetWatchedPaths(tx) => {
                     let _ = tx.send(
                         self.watches
@@ -169,6 +199,85 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    fn update_paths(&mut self, ops: Vec<EventLoopPathOp>) -> StdResult<(), UpdatePathsError> {
+        let mut pending_additions = false;
+        let mut pending_refresh = false;
+        let mut iter = ops.into_iter();
+
+        while let Some(op) = iter.next() {
+            let result = match op {
+                EventLoopPathOp::Watch {
+                    path,
+                    recursive_mode,
+                    origin,
+                } => {
+                    let result = self.add_watch_inner(path, recursive_mode.is_recursive(), true);
+                    if result.is_ok() {
+                        pending_additions = true;
+                        pending_refresh = true;
+                    }
+                    result.map_err(|e| (origin, e))
+                }
+                EventLoopPathOp::Unwatch { path, origin } => {
+                    if pending_additions {
+                        if let Err(source) = self.kqueue.watch().map_err(Error::from) {
+                            return Err(UpdatePathsError {
+                                source,
+                                origin: None,
+                                remaining: std::iter::once(origin)
+                                    .chain(iter.map(EventLoopPathOp::into_origin))
+                                    .collect(),
+                            });
+                        }
+                        pending_additions = false;
+                        pending_refresh = false;
+                    }
+
+                    let result = self
+                        .remove_watch_inner(path, false)
+                        .map_err(|e| (origin, e));
+                    if result.is_ok() {
+                        pending_refresh = true;
+                    }
+                    result
+                }
+            };
+
+            if let Err((origin, source)) = result {
+                if pending_refresh {
+                    if let Err(source) = self.kqueue.watch().map_err(Error::from) {
+                        return Err(UpdatePathsError {
+                            source,
+                            origin: None,
+                            remaining: std::iter::once(origin)
+                                .chain(iter.map(EventLoopPathOp::into_origin))
+                                .collect(),
+                        });
+                    }
+                }
+
+                return Err(UpdatePathsError {
+                    source,
+                    origin: Some(origin),
+                    remaining: iter.map(EventLoopPathOp::into_origin).collect(),
+                });
+            }
+        }
+
+        if pending_refresh {
+            self.kqueue
+                .watch()
+                .map_err(Error::from)
+                .map_err(|source| UpdatePathsError {
+                    source,
+                    origin: None,
+                    remaining: Vec::new(),
+                })?;
+        }
+
+        Ok(())
     }
 
     fn handle_kqueue(&mut self) {
@@ -359,6 +468,20 @@ impl EventLoop {
         is_recursive: bool,
         is_user_watch: bool,
     ) -> Result<()> {
+        self.add_watch_inner(path, is_recursive, is_user_watch)?;
+
+        // Only make a single `kevent` syscall to add all the watches.
+        self.kqueue.watch()?;
+
+        Ok(())
+    }
+
+    fn add_watch_inner(
+        &mut self,
+        path: WatchPath,
+        is_recursive: bool,
+        is_user_watch: bool,
+    ) -> Result<()> {
         let path_is_dir = metadata(&path.absolute).map_err(Error::io)?.is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
         if is_user_watch {
@@ -438,9 +561,6 @@ impl EventLoop {
             }
         }
 
-        // Only make a single `kevent` syscall to add all the watches.
-        self.kqueue.watch()?;
-
         Ok(())
     }
 
@@ -468,19 +588,34 @@ impl EventLoop {
             .add_filename(&path.absolute, event_filter, filter_flags)
             .map_err(|e| Error::io(e).add_path(path.requested.clone()))?;
         let existing_watch = self.watches.get(&path.absolute);
-        let watch = Watch::new(
-            &path,
-            is_recursive,
-            is_user_watch,
-            existing_watch,
-            self.watches.iter(),
-        );
+        let watch = if let Some(existing_watch) = existing_watch {
+            Watch::new(
+                &path,
+                is_recursive,
+                is_user_watch,
+                Some(existing_watch),
+                self.watches.iter(),
+            )
+        } else {
+            Watch {
+                is_recursive,
+                reported_path: path.requested.clone(),
+                is_user_watch,
+                user_is_recursive: is_user_watch && is_recursive,
+            }
+        };
         self.watches.insert(path.absolute, watch);
 
         Ok(())
     }
 
     fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
+        self.remove_watch_inner(path, remove_recursive)?;
+        self.kqueue.watch()?;
+        Ok(())
+    }
+
+    fn remove_watch_inner(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
         log::trace!("removing kqueue watch: {}", path.display());
 
         let preserved_roots = preserved_watch_roots(&path, remove_recursive, self.watches.iter());
@@ -520,8 +655,6 @@ impl EventLoop {
                         .remove_filename(&path, EventFilter::EVFILT_VNODE)
                         .map_err(|e| Error::io(e).add_path(path.clone()))?;
                 }
-
-                self.kqueue.watch()?;
             }
         }
         Ok(())
@@ -599,6 +732,64 @@ impl KqueueWatcher {
         self.waker.wake()?;
         rx.recv().map_err(Error::from)
     }
+
+    fn update_paths_inner(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
+        let mut resolved_ops = Vec::with_capacity(ops.len());
+        let mut iter = ops.into_iter();
+        while let Some(op) = iter.next() {
+            match op {
+                PathOp::Watch(path, config) => {
+                    let recursive_mode = config.recursive_mode();
+                    match WatchPath::new(&path) {
+                        Ok(watch_path) => resolved_ops.push(EventLoopPathOp::Watch {
+                            path: watch_path,
+                            recursive_mode,
+                            origin: PathOp::Watch(path, config),
+                        }),
+                        Err(source) => {
+                            return Err(UpdatePathsError {
+                                source,
+                                origin: Some(PathOp::Watch(path, config)),
+                                remaining: iter.collect(),
+                            });
+                        }
+                    }
+                }
+                PathOp::Unwatch(path) => match absolute_path(&path) {
+                    Ok(absolute) => resolved_ops.push(EventLoopPathOp::Unwatch {
+                        path: absolute,
+                        origin: PathOp::Unwatch(path),
+                    }),
+                    Err(source) => {
+                        return Err(UpdatePathsError {
+                            source,
+                            origin: Some(PathOp::Unwatch(path)),
+                            remaining: iter.collect(),
+                        });
+                    }
+                },
+            }
+        }
+
+        let (tx, rx) = unbounded();
+        self.channel
+            .send(EventLoopMsg::UpdatePaths(resolved_ops, tx))
+            .map_err(|e| UpdatePathsError {
+                source: Error::generic(&e.to_string()),
+                origin: None,
+                remaining: Vec::new(),
+            })?;
+        self.waker.wake().map_err(|e| UpdatePathsError {
+            source: Error::generic(&e.to_string()),
+            origin: None,
+            remaining: Vec::new(),
+        })?;
+        rx.recv().map_err(|e| UpdatePathsError {
+            source: Error::from(e),
+            origin: None,
+            remaining: Vec::new(),
+        })?
+    }
 }
 
 impl Watcher for KqueueWatcher {
@@ -621,6 +812,10 @@ impl Watcher for KqueueWatcher {
 
     fn watched_paths(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
         self.watched_paths_inner()
+    }
+
+    fn update_paths(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
+        self.update_paths_inner(ops)
     }
 
     fn kind() -> crate::WatcherKind {
